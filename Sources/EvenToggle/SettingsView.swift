@@ -14,8 +14,12 @@ struct SettingsView: View {
         Form {
             Section("Connection") {
                 HStack {
-                    SecureField("Auth token", text: $server.token)
-                    Button("Generate") { server.token = Self.randomToken() }
+                    Text("Pairing token: kept by even-terminal in ~/.even-terminal/config.json")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Show config") {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: ServerController.evenTerminalConfigPath)])
+                    }
                 }
                 TextField("Port", text: $server.port)
                 Toggle("Use Tailscale (connect from anywhere)", isOn: $server.useTailscale)
@@ -73,10 +77,5 @@ struct SettingsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             server.projectPath = url.path
         }
-    }
-
-    /// 24 random bytes as hex — your fixed token. Set it once and keep it.
-    static func randomToken() -> String {
-        (0..<24).map { _ in String(format: "%02x", Int.random(in: 0..<256)) }.joined()
     }
 }

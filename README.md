@@ -1,3 +1,9 @@
+> **Fork note (RussReadsBooks/even-toggle):** default branch `security-hardening` adds, on top of upstream `65489ad`:
+> menu-bar icon shows on/off state; server stops on quit; no copy of the pairing token (even-terminal reads `~/.even-terminal/config.json`, never `-t`/defaults);
+> token/QR redaction in the log panel; caffeinate tied to the server; no orphaned server (signals + reap on relaunch);
+> trusted-path launch, validated settings and an allowlisted child environment; build output untracked.
+> Intended to be offered upstream as a PR once tested.
+
 # EvenToggle 👓
 
 A tiny macOS menu bar app that turns your **Claude Code + Even Realities G2**
@@ -101,7 +107,7 @@ config, so the host on your glasses keeps connecting — you never scan again.
 
 | Setting | What it does |
 |---|---|
-| **Auth token** | The password your glasses use to reach the server. Click **Generate** once, then leave it. Keep a copy somewhere safe. |
+| **Pairing token** | Not stored by this app. even-terminal keeps it in `~/.even-terminal/config.json` (set it with `even-terminal config`); EvenToggle never passes it on the command line. |
 | **Port** | The number the server listens on (default 3456). Keep it fixed. |
 | **Use Tailscale** | Makes the address permanent so it works from anywhere and never needs re-pairing. |
 | **Keep Mac awake** | Stops the Mac sleeping while the server runs (`caffeinate`). |

@@ -22,8 +22,9 @@ struct EvenToggleApp: App {
             MenuContent()
                 .environmentObject(server)
         } label: {
-            // The menu bar item is simply the glasses emoji.
-            Text("👓")
+            // Glasses when the server is on, crossed-out glasses when it's off.
+            Image(systemName: server.isRunning ? "eyeglasses" : "eyeglasses.slash")
+                .accessibilityLabel(server.isRunning ? "Even Terminal on" : "Even Terminal off")
         }
         .menuBarExtraStyle(.menu)
 

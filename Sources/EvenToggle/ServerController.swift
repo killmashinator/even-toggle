@@ -4,8 +4,9 @@
 //  starts/stops the `even-terminal` server as a child process.
 //
 //  Mental model: this is like typing the `even-terminal ...` command for you,
-//  with your saved token/port/folder/model filled in — and killing it when you
-//  toggle off. Because the token and port never change, the host you paired on
+//  with your saved port/folder/model filled in — and killing it when you
+//  toggle off. even-terminal reads its own pairing token from
+//  ~/.even-terminal/config.json (this app never stores or passes it). Because the token and port never change, the host you paired on
 //  your glasses keeps working across restarts. Pair once, reuse forever.
 //
 //  IMPORTANT (why this file is more than a one-liner): a GUI app launched from
@@ -27,7 +28,6 @@ final class ServerController: ObservableObject {
     @Published var lastLog = ""
 
     // Persisted settings. @AppStorage saves these to disk automatically.
-    @AppStorage("token")            var token = ""
     @AppStorage("port")             var port = "3456"
     @AppStorage("provider")         var provider = "claude"        // "claude" or "codex"
     @AppStorage("model")            var model = "default"          // default|sonnet|opus|haiku|fable|custom
@@ -37,16 +37,83 @@ final class ServerController: ObservableObject {
     @AppStorage("keepAwake")        var keepAwake = true
     // Leave blank to auto-detect. Only set this to override the detected path.
     @AppStorage("evenTerminalPath") var evenTerminalPath = ""
+    // PID of the server we last launched, so a crash/force-quit of this app
+    // can't leave it running unnoticed: it's reaped on the next launch.
+    @AppStorage("serverPID")        var serverPID = 0
 
     private var process: Process?
+    private var caffeinate: Process?
     private var cachedPATH: String?
+    private var signalSources: [DispatchSourceSignal] = []
+
+    init() {
+        // Stop the server when the app quits, so it never keeps running orphaned
+        // while the menu bar icon says "off".
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stop() }
+        }
+        // willTerminate doesn't fire for SIGTERM/SIGINT/SIGHUP (e.g. `kill`,
+        // logout edge cases), so handle those too. SIGKILL can't be caught;
+        // reapOrphan() covers that on the next launch.
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { [weak self] in
+                MainActor.assumeIsolated { self?.stop() }
+                exit(0)
+            }
+            src.resume()
+            signalSources.append(src)
+        }
+        reapOrphan()
+    }
+
+    /// If a server we launched outlived a previous run of this app, stop it.
+    private func reapOrphan() {
+        let pid = pid_t(serverPID)
+        guard pid > 0 else { return }
+        serverPID = 0
+        guard kill(pid, 0) == 0, Self.commandLine(of: pid)?.contains("even-terminal") == true else { return }
+        kill(pid, SIGTERM)
+        lastLog = "Stopped a leftover even-terminal (pid \(pid)) from a previous run."
+    }
+
+    private static func commandLine(of pid: pid_t) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-o", "command=", "-p", String(pid)]
+        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        p.waitUntilExit()
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    }
+
+    static let evenTerminalConfigPath =
+        (NSHomeDirectory() as NSString).appendingPathComponent(".even-terminal/config.json")
 
     func toggle() { isRunning ? stop() : start() }
 
     func start() {
         guard !isRunning else { return }
-        guard !token.isEmpty else {
-            lastLog = "Set an auth token in Settings first."
+        // even-terminal reads its pairing token from its own config file.
+        guard FileManager.default.fileExists(atPath: Self.evenTerminalConfigPath) else {
+            lastLog = "No ~/.even-terminal/config.json yet. Run `even-terminal config` in Terminal first."
+            return
+        }
+        // Validate settings before they reach the command line.
+        guard let portNum = Int(port.trimmingCharacters(in: .whitespaces)), (1024...65535).contains(portNum) else {
+            lastLog = "Port must be a number from 1024 to 65535."
+            return
+        }
+        guard ["claude", "codex"].contains(provider) else {
+            lastLog = "Unknown provider \"\(provider)\". Choose claude or codex."
+            return
+        }
+        if model == "custom",
+           customModel.isEmpty || customModel.range(of: #"^[A-Za-z0-9._:\[\]-]{1,100}$"#, options: .regularExpression) == nil {
+            lastLog = "Custom model id may only contain letters, digits and . _ : - [ ]"
             return
         }
         guard !projectPath.isEmpty else {
@@ -55,7 +122,7 @@ final class ServerController: ObservableObject {
         }
 
         // 1) Figure out the real PATH (same as your Terminal), then find the CLI.
-        let path = resolvedPATH()
+        let path = Self.trustedPATH(resolvedPATH())
         guard let etPath = resolveEvenTerminal(searchPATH: path) else {
             lastLog = """
             Couldn't find even-terminal. Install it with:
@@ -76,6 +143,10 @@ final class ServerController: ObservableObject {
             return
         }
 
+        // Read the token only to redact it from captured output; it's never
+        // stored, passed, or displayed.
+        let knownToken = LogRedactor.tokenFromConfig(atPath: Self.evenTerminalConfigPath)
+
         let p = Process()
         p.executableURL = URL(fileURLWithPath: etPath)
 
@@ -85,16 +156,29 @@ final class ServerController: ObservableObject {
         p.currentDirectoryURL = URL(fileURLWithPath: project, isDirectory: true)
 
         // Build the same command you'd type by hand:
-        //   even-terminal --provider claude -t <token> -p <port> -d <folder> [--tailscale]
-        var args = ["--provider", provider, "-t", token, "-p", port, "-d", project]
+        //   even-terminal --provider claude -p <port> -d <folder> [--tailscale]
+        // No -t: even-terminal takes the token from ~/.even-terminal/config.json,
+        // so it never shows up in argv (visible to `ps`) or in this app's defaults.
+        var args = ["--provider", provider, "-p", String(portNum), "-d", project]
         if useTailscale { args.append("--tailscale") }
         p.arguments = args
 
         // Give the child the real PATH, with even-terminal's own directory first
         // (that's where `node` lives for nvm/Volta/etc., so the shebang resolves).
-        var env = ProcessInfo.processInfo.environment
+        // Pass only what the server and Claude Code need, not this app's whole
+        // environment (allowlist; BRIDGE_TOKEN and other secrets never pass).
+        let keep: Set<String> = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG",
+                                 "SSH_AUTH_SOCK", "__CF_USER_TEXT_ENCODING"]
+        var env = ProcessInfo.processInfo.environment.filter { k, _ in
+            keep.contains(k) || k.hasPrefix("LC_")
+        }
+        env["NO_COLOR"] = "1"   // plain output for the log panel
         let etDir = URL(fileURLWithPath: etPath).deletingLastPathComponent().path
-        env["PATH"] = etDir + ":" + path
+        // Only trusted (not group/world-writable) directories, so a planted
+        // `node`/`claude`/`tailscale` earlier in PATH can't be picked up.
+        env["PATH"] = Self.trustedPATH(etDir + ":" + path)
+        // Belt and braces: a stray BRIDGE_TOKEN would override the config file's token.
+        env.removeValue(forKey: "BRIDGE_TOKEN")
 
         // Model selection. We do TWO things so the choice sticks even on the
         // voice-only glasses (where you can't type /model):
@@ -111,15 +195,18 @@ final class ServerController: ObservableObject {
         }
         p.environment = env
 
-        // Capture output so we can show it in Settings → Advanced (incl. the
-        // pairing QR the very first time, and any error explaining a failure).
+        // Capture output (in memory only, never written to disk) so Settings →
+        // Advanced can show errors. Token, pairing URL and QR art are redacted.
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in self?.lastLog = text }
+            // even-terminal prints the full token, a pairing URL containing it, and
+            // a QR code encoding it. Redact before anything is stored or shown.
+            let safe = LogRedactor.redact(text, knownToken: knownToken)
+            Task { @MainActor in self?.lastLog = safe }
         }
 
         // When the process ends (crash, kill, reboot), flip our state back.
@@ -127,12 +214,15 @@ final class ServerController: ObservableObject {
             Task { @MainActor in
                 self?.isRunning = false
                 self?.process = nil
+                self?.caffeinate?.terminate()
+                self?.caffeinate = nil
             }
         }
 
         do {
             try p.run()
             process = p
+            serverPID = Int(p.processIdentifier)
             isRunning = true
             let modelNote = (model == "default")
                 ? "Model: Claude Code default"
@@ -145,11 +235,14 @@ final class ServerController: ObservableObject {
 
             // Optionally keep the Mac awake for as long as the server runs.
             // `caffeinate -w <pid>` exits by itself once that pid exits.
+            // Tracked so stop() and quit end it too, not only the server's exit.
             if keepAwake {
                 let c = Process()
                 c.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
                 c.arguments = ["-s", "-w", String(p.processIdentifier)]
-                try? c.run()
+                c.standardOutput = FileHandle.nullDevice
+                c.standardError = FileHandle.nullDevice
+                if (try? c.run()) != nil { caffeinate = c }
             }
         } catch {
             lastLog = "Failed to start: \(error.localizedDescription)"
@@ -158,8 +251,18 @@ final class ServerController: ObservableObject {
     }
 
     func stop() {
-        process?.terminate()
+        if let p = process, p.isRunning {
+            let pid = p.processIdentifier
+            p.terminate()
+            // Escalate if it ignores SIGTERM, so it can't linger after "off".
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+            }
+        }
         process = nil
+        serverPID = 0
+        caffeinate?.terminate()
+        caffeinate = nil
         isRunning = false
         lastLog = "Stopped."
     }
@@ -181,6 +284,12 @@ final class ServerController: ObservableObject {
            let parsed = obj as? [String: Any] {
             dict = parsed
         }
+
+        // Leave the user's Claude settings untouched unless the value changes
+        // (avoids rewriting/reformatting it, or replacing a symlink, every start).
+        let current = dict["model"] as? String
+        let wanted = (model?.isEmpty == false) ? model : nil
+        if current == wanted { return }
 
         if let model, !model.isEmpty {
             dict["model"] = model
@@ -221,25 +330,64 @@ final class ServerController: ObservableObject {
     /// else ask the login shell directly.
     private func resolveEvenTerminal(searchPATH: String) -> String? {
         let fm = FileManager.default
-        if !evenTerminalPath.isEmpty, fm.isExecutableFile(atPath: evenTerminalPath) {
+        if !evenTerminalPath.isEmpty, fm.isExecutableFile(atPath: evenTerminalPath),
+           Self.isTrusted(evenTerminalPath) {
             return evenTerminalPath
         }
         for dir in searchPATH.split(separator: ":") {
             let candidate = String(dir) + "/even-terminal"
-            if fm.isExecutableFile(atPath: candidate) { return candidate }
+            if fm.isExecutableFile(atPath: candidate), Self.isTrusted(candidate) { return candidate }
         }
         if let out = Self.loginShellOutput(#"printf '___E___%s' "$(command -v even-terminal)""#),
            let r = out.range(of: "___E___") {
             let p = out[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !p.isEmpty, fm.isExecutableFile(atPath: p) { return p }
+            if !p.isEmpty, p.hasPrefix("/"), fm.isExecutableFile(atPath: p), Self.isTrusted(p) { return p }
         }
         return nil
+    }
+
+    /// True if `path` (and its symlink target) and every parent directory are
+    /// owned by root or this user, never world-writable, and group-writable only
+    /// for this user's own group or `admin` (Homebrew's /opt/homebrew is 775 admin).
+    static func isTrusted(_ path: String) -> Bool {
+        guard path.hasPrefix("/") else { return false }
+        // realpath(3), not NSString.resolvingSymlinksInPath (which strips /private).
+        guard let rp = realpath(path, nil) else { return false }
+        let resolved = String(cString: rp); free(rp)
+        for start in Set([path, resolved]) {
+            var p = start
+            while true {
+                guard let a = try? FileManager.default.attributesOfItem(atPath: p),
+                      let owner = a[.ownerAccountID] as? NSNumber,
+                      let perms = a[.posixPermissions] as? NSNumber else { return false }
+                let isLink = (a[.type] as? FileAttributeType) == .typeSymbolicLink
+                if owner.uint32Value != 0 && owner.uint32Value != getuid() { return false }
+                let group = (a[.groupOwnerAccountID] as? NSNumber)?.uint32Value ?? 0
+                if !isLink && perms.intValue & 0o002 != 0 { return false }
+                if !isLink && perms.intValue & 0o020 != 0 && group != 80 && group != getgid() { return false }
+                if p == "/" { break }
+                p = (p as NSString).deletingLastPathComponent
+            }
+        }
+        return true
+    }
+
+    /// Keep only absolute, existing, trusted PATH entries (order preserved, deduped).
+    static func trustedPATH(_ path: String) -> String {
+        var seen = Set<String>()
+        return path.split(separator: ":").map(String.init).filter {
+            $0.hasPrefix("/") && seen.insert($0).inserted && isTrusted($0)
+        }.joined(separator: ":")
     }
 
     /// Run a command in the user's login shell and return stdout, with a timeout
     /// so a misbehaving startup file can't hang the app.
     private static func loginShellOutput(_ command: String, timeout: TimeInterval = 5) -> String? {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        // Only a shell listed in /etc/shells; otherwise fall back to zsh.
+        let envShell = ProcessInfo.processInfo.environment["SHELL"] ?? ""
+        let allowed = ((try? String(contentsOfFile: "/etc/shells", encoding: .utf8)) ?? "")
+            .split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        let shell = allowed.contains(envShell) ? envShell : "/bin/zsh"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: shell)
         p.arguments = ["-ilc", command]   // interactive+login so nvm/rc files load
